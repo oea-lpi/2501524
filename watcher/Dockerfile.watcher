@@ -6,9 +6,8 @@ RUN pip install --no-cache-dir redis
 
 COPY . /app
 
-RUN mkdir -p files/input1 \
-            files/input2 \
-            files/input3 \
-            logs
+RUN mkdir -p logs
+
+VOLUME ["/app/logs"]
 
 CMD ["python", "alarm_reset_worker.py"]
