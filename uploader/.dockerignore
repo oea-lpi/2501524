@@ -1,0 +1,9 @@
+venv/
+.gitignore
+modbus_writer.py 
+__pycache__/
+*.pyc
+*.logl
+*.tmp
+.env
+files/

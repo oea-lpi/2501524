@@ -1,0 +1,26 @@
+FROM python:3.12.9-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+    openssh-client \
+    sshpass \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . /app
+
+RUN mkdir -p files/input1 \
+            files/input2 \
+            files/input3 \
+            logs
+
+VOLUME ["/app/files/input1", \
+        "/app/files/input2", \
+        "/app/files/input3", \
+        "/app/logs"]
+
+CMD ["python", "main.py"]

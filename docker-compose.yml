@@ -1,0 +1,51 @@
+services:
+  redis:
+    image: redis:latest
+    volumes:
+      - redis_data:/data
+    restart: on-failure:5
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"  
+    depends_on:
+      - redis
+    mem_limit: 512m
+
+  uploader:
+    build:
+      context: ./uploader
+      dockerfile: Dockerfile.uploader
+    env_file:
+      - ./.env
+    restart: unless-stopped
+    volumes:
+      - ./logger:/app/logger
+      - ./helper:/app/helper
+      - "C:/Users/oelawad/Desktop/Software/2501524/files/logs:/app/logs"
+      - "C:/Users/oelawad/Desktop/Software/2501524/files/input1:/app/files/input1"
+      - "C:/Users/oelawad/Desktop/Software/2501524/files/input2:/app/files/input2"      
+      - "C:/Users/oelawad/Desktop/Software/2501524/files/input3:/app/files/input3"      
+  
+  alarm-reset-worker:
+    build:
+      context: ./watcher
+      dockerfile: Dockerfile.watcher
+    env_file:
+      - ./.env
+    depends_on:
+      - redis
+    restart: unless-stopped
+    volumes:
+      - ./logger:/app/logger
+      - "C:/Users/oelawad/Desktop/Software/2501524/files/logs:/app/logs"
+
+volumes:
+  redis_data:
