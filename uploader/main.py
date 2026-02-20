@@ -37,6 +37,31 @@ class ProgressPrinter:
             return
         self.last_print = now
 
+        percent = (transferred / total) * 100 if total else 0.0
+
+        elapsed = now - self.start
+        speed = transferred / elapsed if elapsed > 0 else 0.0
+        speed_mb = speed / (1024 * 1024)
+
+        remaining = total - transferred
+        eta = remaining / speed if speed > 0 else 0.0
+
+        msg = (
+            f"{self.filename} "
+            f"{percent:6.2f}% "
+            f"{transferred/1e6:8.1f}/{total/1e6:8.1f} MB "
+            f"{speed_mb:6.2f} MB/s "
+            f"ETA {eta:6.1f}s"
+        )
+
+        print(f"[{self.job_name}] {msg}", flush=True)
+        now = time.time()
+
+        # throttle prints (avoid flooding logs)
+        if now - self.last_print < 1.0 and transferred != total:
+            return
+        self.last_print = now
+
         percent = (transferred / total) * 100 if total else 0
 
         elapsed = now - self.start
@@ -69,7 +94,7 @@ def save_cursor(path: Path, cursor: Cursor) -> None:
     path.write_text(json.dumps({"mtime": cursor.mtime, "name": cursor.name}), encoding="utf-8")
 
 
-def sftp_upload(sftp: paramiko.SFTPClient, local_file: Path, remote_dir: str) -> bool:
+def sftp_upload(sftp: paramiko.SFTPClient, job_name: str, local_file: Path, remote_dir: str) -> bool:
     """
     Upload with temp name + atomic rename:
       local -> remote/<name>.part -> rename to remote/<name>
@@ -92,8 +117,7 @@ def sftp_upload(sftp: paramiko.SFTPClient, local_file: Path, remote_dir: str) ->
     except FileNotFoundError:
         pass
 
-    local_size = local_file.stat().st_size
-    progress = ProgressPrinter(local_file.name, local_size)
+    progress = ProgressPrinter(job_name, local_file.name, local_size)
 
     sftp.put(
         str(local_file),
@@ -159,20 +183,21 @@ def upload_newest_file(
         ssh.get_transport().set_keepalive(30)
         sftp = ssh.open_sftp()
 
-        uploaded_any = False
         try:
             while True:
-                candidate = next_stable_file_after_cursor(
-                    local_dir,
-                    cursor_mtime=cursor.mtime,
-                    cursor_name=cursor.name,
-                    settle_sec=settle_sec,
-                )
-                if candidate is None:
-                    break 
+                uploaded_any = False
 
-                try:
-                    uploaded = sftp_upload(sftp, candidate, remote_dir)
+                while True:
+                    candidate = next_stable_file_after_cursor(
+                        local_dir,
+                        cursor_mtime=cursor.mtime,
+                        cursor_name=cursor.name,
+                        settle_sec=settle_sec,
+                    )
+                    if candidate is None:
+                        break
+
+                    uploaded = sftp_upload(sftp, job_name, candidate, remote_dir)
 
                     st = candidate.stat()
                     cursor = Cursor(mtime=float(st.st_mtime), name=candidate.name)
@@ -184,12 +209,7 @@ def upload_newest_file(
                     else:
                         print(f"[{job_name}] already present {candidate.name}", flush=True)
 
-                except Exception as e:
-                    print(f"[{job_name}] upload failed ({candidate.name}): {e}", flush=True)
-                    alarm_pulse(redis_db, health_hash, f"{health_sftp_upload_key}:{job_name}")
-                    raise
-
-            time.sleep(upload_interval_sec if not uploaded_any else 5)
+                time.sleep(upload_interval_sec if not uploaded_any else 5)
 
         finally:
             try:
