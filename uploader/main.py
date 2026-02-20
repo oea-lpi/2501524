@@ -1,32 +1,72 @@
-import logging
 import time
 import threading
 from pathlib import Path
-from typing import Optional
 
 import paramiko
 import redis
 
-from auxiliary import newest_file, is_file_stable, remote_file_size
+from auxiliary import next_stable_file_after_cursor, remote_file_size
 from config import get_parameter
-#from logger.setup_logging import setup_logging
 from helper.redis_utility import alarm_pulse
 
-#logger = logging.getLogger("uploader")
+import json
+from dataclasses import dataclass
+
+
+@dataclass
+class Cursor:
+    mtime: float
+    name: str
+
+
+def load_cursor(path: Path) -> Cursor:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return Cursor(mtime=float(data.get("mtime", 0.0)), name=str(data.get("name", "")))
+    except Exception:
+        return Cursor(mtime=0.0, name="")
+
+
+def save_cursor(path: Path, cursor: Cursor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mtime": cursor.mtime, "name": cursor.name}), encoding="utf-8")
 
 
 def sftp_upload(sftp: paramiko.SFTPClient, local_file: Path, remote_dir: str) -> bool:
-    remote_final_path = f"{remote_dir.rstrip('/')}/{local_file.name}"
+    """
+    Upload with temp name + atomic rename:
+      local -> remote/<name>.part -> rename to remote/<name>
 
-    remote_size = remote_file_size(sftp, remote_final_path)
+    If remote final exists with same size => skip.
+    If remote final exists with different size => write duplicate name suffix.
+    """
+    remote_dir = remote_dir.rstrip("/")
+    final_path = f"{remote_dir}/{local_file.name}"
+    tmp_path = f"{final_path}.part"
+
     local_size = local_file.stat().st_size
+
+    remote_size = remote_file_size(sftp, final_path)
     if remote_size is not None and remote_size == local_size:
         return False
-    elif remote_size is not None and remote_size != local_size:
-        ts = int(local_file.stat().st_mtime)
-        remote_final_path = f"{remote_final_path}.dup_{ts}"
 
-    sftp.put(str(local_file), remote_final_path)
+    try:
+        sftp.remove(tmp_path)
+    except FileNotFoundError:
+        pass
+
+    sftp.put(str(local_file), tmp_path)
+
+    tmp_size = remote_file_size(sftp, tmp_path)
+    if tmp_size != local_size:
+        raise RuntimeError(f"Remote tmp size mismatch: {tmp_size} != {local_size}")
+
+    remote_size = remote_file_size(sftp, final_path)
+    if remote_size is not None and remote_size != local_size:
+        ts = int(local_file.stat().st_mtime)
+        final_path = f"{final_path}.dup_{ts}"
+
+    sftp.rename(tmp_path, final_path)
     return True
 
 
@@ -43,52 +83,84 @@ def upload_newest_file(
     health_sftp_upload_key: str,
     job_name: str,
 ) -> None:
+    """
+    Persistent, scalable uploader:
+      - Uses a per-job cursor (mtime+name) so it doesn't need to remember all uploaded files.
+      - Selects the next stable file after the cursor, ordered by (mtime, name).
+      - Uploads via .part then rename to avoid partial final files.
+      - Reconnects on failures with backoff.
+    """
+    state_path = Path("/app/logs") / f"cursor_{job_name}.json"
+    cursor = load_cursor(state_path)
+
+    settle_sec = 60.0 
+    backoff = 2.0
+    backoff_max = 45.0
+
     while True:
         ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy()) 
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         try:
-            print(f"[{job_name}] {host}, {user}", flush=True)
+            print(f"[{job_name}] connecting {host} as {user}", flush=True)
             ssh.connect(host, 22, user, password, timeout=10)
+            backoff = 2.0 
         except Exception:
-            #logger.exception(f"[{job_name}] Could not connect to remote SFTP-server.")
-            print("Cant connect.", flush=True)
+            print(f"[{job_name}] connect failed; retry in {backoff:.0f}s", flush=True)
             alarm_pulse(redis_db, health_hash, f"{health_sftp_connect_key}:{job_name}")
-            time.sleep(upload_interval_sec)
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, backoff_max)
             continue
 
-        print("Do I even get here?", flush=True)
         ssh.get_transport().set_keepalive(30)
         sftp = ssh.open_sftp()
 
+        uploaded_any = False
         try:
-            last_uploaded_name: Optional[str] = None
             while True:
-                new_file = newest_file(local_dir)
-                if new_file and is_file_stable(new_file):
-                    try:
-                        if new_file.name != last_uploaded_name:
-                            if sftp_upload(sftp, new_file, remote_dir):
-                                last_uploaded_name = new_file.name
-                                #logger.debug(f"[{job_name}] Uploaded {new_file.name}.")
-                    except Exception:
-                        #logger.exception(f"[{job_name}] Upload failed for {new_file.name}, skip.")
-                        alarm_pulse(redis_db, health_hash, f"{health_sftp_upload_key}:{job_name}")
+                candidate = next_stable_file_after_cursor(
+                    local_dir,
+                    cursor_mtime=cursor.mtime,
+                    cursor_name=cursor.name,
+                    settle_sec=settle_sec,
+                )
+                if candidate is None:
+                    break 
 
-                time.sleep(upload_interval_sec)
+                try:
+                    uploaded = sftp_upload(sftp, candidate, remote_dir)
+
+                    st = candidate.stat()
+                    cursor = Cursor(mtime=float(st.st_mtime), name=candidate.name)
+                    save_cursor(state_path, cursor)
+
+                    uploaded_any = True
+                    if uploaded:
+                        print(f"[{job_name}] uploaded {candidate.name}", flush=True)
+                    else:
+                        print(f"[{job_name}] already present {candidate.name}", flush=True)
+
+                except Exception as e:
+                    print(f"[{job_name}] upload failed ({candidate.name}): {e}", flush=True)
+                    alarm_pulse(redis_db, health_hash, f"{health_sftp_upload_key}:{job_name}")
+                    raise
+
+            time.sleep(upload_interval_sec if not uploaded_any else 5)
 
         finally:
             try:
                 sftp.close()
             except Exception:
                 pass
-            ssh.close()
+            try:
+                ssh.close()
+            except Exception:
+                pass
 
-        time.sleep(upload_interval_sec)
+        time.sleep(min(upload_interval_sec, 5))
 
 
 def main():
-    #setup_logging(process_name="uploader")
     para = get_parameter()
 
     redis_db = redis.Redis(
@@ -108,7 +180,7 @@ def main():
                 user=para.LPI_SFTP_USER,
                 password=para.LPI_SFTP_PASSWORD,
                 local_dir=job.local_dir,
-                remote_dir=job.remote_dir,  # keep as str
+                remote_dir=job.remote_dir,
                 upload_interval_sec=para.UPLOAD_INTERVAL_SEC,
                 redis_db=redis_db,
                 health_hash=para.HEALTH_HASH,
@@ -121,7 +193,6 @@ def main():
         )
         t.start()
         threads.append(t)
-        #logger.info(f"Started uploader for {job.local_dir} -> {job.remote_dir}")
 
     while True:
         for t in threads:

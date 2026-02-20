@@ -50,6 +50,6 @@ def get_parameter() -> Parameter:
         REDIS_PORT=int(os.getenv("REDIS_PORT", "6379")),
         REDIS_DB=int(os.getenv("REDIS_DB", "0")),
 
-        UPLOAD_INTERVAL_SEC=20,
+        UPLOAD_INTERVAL_SEC=120,
         UPLOAD_JOBS=_parse_jobs(raw_jobs),
     )

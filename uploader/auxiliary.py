@@ -1,33 +1,55 @@
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
-import paramiko
 
-def newest_file(dirpath: Path) -> Optional[Path]:
+def next_stable_file_after_cursor(
+    dirpath: Path,
+    cursor_mtime: float,
+    cursor_name: str,
+    settle_sec: float = 600.0,
+) -> Optional[Path]:
     """
-    Find the newst file my mtime in a folder.
+    Return the stable file with the smallest (mtime, name) that is > (cursor_mtime, cursor_name).
+
+    - Stable = "has not been modified for settle_sec seconds" (mtime age).
+    - Cursor = last successfully uploaded file (mtime + name tie-breaker).
+    Note: This scans the directory. For very large dirs, increase scan interval (UPLOAD_INTERVAL_SEC).
     """
-    files = [p for p in dirpath.iterdir() if p.is_file()]
-    if not files:
-        return None
-    return max(files, key=lambda p: p.stat().st_mtime)
-    
-def is_file_stable(filepath: Path, settle_sec: float = 240.0) -> bool:
-    """
-    Avoid uploading a file that is still being written.
-    """
+    cursor_key: Tuple[float, str] = (cursor_mtime, cursor_name)
+    now = time.time()
+
+    best: Optional[Path] = None
+    best_key: Optional[Tuple[float, str]] = None
+
     try:
-        s1 = filepath.stat().st_size
-        time.sleep(settle_sec)
-        s2 = filepath.stat().st_size
-        return s1 == s2
+        it = dirpath.iterdir()
     except FileNotFoundError:
-        return False
-    
-def remote_file_size(sftp: paramiko.SFTPClient, remote_path: str) -> Optional[int]:
+        return None
+
+    for p in it:
+        if not p.is_file():
+            continue
+
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+
+        k: Tuple[float, str] = (float(st.st_mtime), p.name)
+        if k <= cursor_key:
+            continue
+        if (now - float(st.st_mtime)) < settle_sec:
+            continue
+        if best_key is None or k < best_key:
+            best = p
+            best_key = k
+
+    return best
+
+
+def remote_file_size(sftp, remote_path: str) -> Optional[int]:
     try:
         return sftp.stat(remote_path).st_size
     except FileNotFoundError:
         return None
-    
