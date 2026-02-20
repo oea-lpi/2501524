@@ -18,6 +18,43 @@ class Cursor:
     mtime: float
     name: str
 
+import sys
+
+
+class ProgressPrinter:
+    def __init__(self, job_name: str, filename: str, total: int):
+        self.job_name = job_name
+        self.filename = filename
+        self.total = total
+        self.start = time.time()
+        self.last_print = 0.0
+
+    def __call__(self, transferred: int, total: int):
+        now = time.time()
+
+        # throttle prints (avoid flooding logs)
+        if now - self.last_print < 1.0 and transferred != total:
+            return
+        self.last_print = now
+
+        percent = (transferred / total) * 100 if total else 0
+
+        elapsed = now - self.start
+        speed = transferred / elapsed if elapsed > 0 else 0
+        speed_mb = speed / (1024 * 1024)
+
+        remaining = total - transferred
+        eta = remaining / speed if speed > 0 else 0
+
+        msg = (
+            f"{self.filename} "
+            f"{percent:6.2f}% "
+            f"{transferred/1e6:8.1f}/{total/1e6:8.1f} MB "
+            f"{speed_mb:6.2f} MB/s "
+            f"ETA {eta:6.1f}s"
+        )
+
+        print(msg, flush=True)
 
 def load_cursor(path: Path) -> Cursor:
     try:
@@ -55,7 +92,14 @@ def sftp_upload(sftp: paramiko.SFTPClient, local_file: Path, remote_dir: str) ->
     except FileNotFoundError:
         pass
 
-    sftp.put(str(local_file), tmp_path)
+    local_size = local_file.stat().st_size
+    progress = ProgressPrinter(local_file.name, local_size)
+
+    sftp.put(
+        str(local_file),
+        tmp_path,
+        callback=progress,
+    )
 
     tmp_size = remote_file_size(sftp, tmp_path)
     if tmp_size != local_size:
